@@ -1,0 +1,11 @@
+# Synced pages and local sync state (never commit your Notion content)
+/notion/
+/.notion/
+/.notion-index.json
+
+# Generated help tags
+doc/tags
+
+# OS / editor
+.DS_Store
+*.swp

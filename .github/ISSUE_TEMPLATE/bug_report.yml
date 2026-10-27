@@ -1,0 +1,33 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't paste your Notion token or private page content.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead (include the exact error message).
+    validations:
+      required: true
+  - type: textarea
+    id: markdown
+    attributes:
+      label: Markdown that triggers it
+      description: A minimal snippet of the page, if the problem is with publishing or syncing.
+      render: markdown
+  - type: input
+    id: version
+    attributes:
+      label: Neovim version
+      description: Output of `nvim --version | head -1`
+    validations:
+      required: true
+  - type: textarea
+    id: health
+    attributes:
+      label: ":checkhealth notion"
+      render: text
