@@ -20,6 +20,8 @@ M.defaults = {
 	notify_on_save = true,
 	-- Run :Notion sync in the background on startup.
 	sync_on_startup = false,
+	-- false: :Notion sync only updates pages you already have; add more with :Notion get.
+	sync_all = true,
 	-- Optional predicate `fun(page): boolean` to choose which pages get synced.
 	filter = nil,
 }

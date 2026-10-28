@@ -75,13 +75,15 @@ Full documentation: `:help notion`.
 │ 4 pages · 2 unpublished     ││+++ local                                   │
 │ synced 5m ago · ~/p/notion  ││ - laptop                                   │
 ╰─────────────────────────────╯│-- accounts                                 │
-╭ [2] Pages ──────────────────╮│+- accounts **today**                       │
+╭ [2] Working ────────────────╮│+- accounts **today**                       │
 │  ▾ Engineering              ││+- meet the team                            │
 │M     Onboarding             ││                                            │
-│      Runbooks               ││                                            │
+╰─────────────────────────────╯│                                            │
+╭ [3] Pages ──────────────────╮│                                            │
+│  ▸ Engineering ★            ││                                            │
 │A   Ideas                    ││                                            │
 ╰─────────────────────────────╯│                                            │
-╭ [3] Unpublished (2) ────────╮│                                            │
+╭ [4] Unpublished (2) ────────╮│                                            │
 │A   Ideas                    ││                                            │
 │M   Onboarding               ││                                            │
 ╰─────────────────────────────╯╰────────────────────────────────────────────╯
@@ -90,13 +92,24 @@ Full documentation: `:help notion`.
 
 - **[1] Status** shows the folder's login (`● workspace · integration`, or
   `○ Not logged in · press L`), page counts, last sync time and the folder.
-- **[2] Pages** shows your Notion page tree. `M` means unpublished changes and `A` means a new draft.
-- **[3] Unpublished** lists everything waiting to be published.
+- **[2] Working** holds the pages you're working on (`w` adds or removes one), with
+  their sub-pages. It's saved per folder, and the dashboard opens here, so you don't
+  have to dig through hundreds of pages. Pages you `get` and new drafts are added automatically.
+- **[3] Pages** shows your Notion page tree. `M` means unpublished changes, `A` means a new
+  draft and `★` means it's in Working. Press `/` to search titles and content as you type;
+  the list shows the matches, the preview jumps to the first one and `⏎` opens the page there.
+- **[4] Unpublished** lists everything waiting to be published.
 - **[0] Preview** shows the page. If the page has local edits, it shows a diff against the last synced version instead. The diff is computed locally, with no API call.
 
-Keys: `⏎`/`e` open, `p` publish, `s` sync, `P` pull, `d` diff with the live Notion page
-(shown in the right panel; `Esc` returns to the preview), `D` full-screen side-by-side diff, `n` new draft,
-`o` browser, `L` log in this folder, `r` refresh, `␣`/`za`/`h`/`l` fold, `1 2 3 0` / `⇥` switch panels,
+Press `S` to choose the folder's sync mode in a modal: **all pages** shared with the
+integration, or **only pages you already have** (pulled pages get updated, and new
+sub-pages created under them in Notion come along; unrelated new pages are skipped, add
+them with `g`). The choice is saved per folder and shown in the Status panel
+(`sync: all` / `sync: pulled only`); the `sync_all` option is the default until you pick.
+
+Keys: `⏎`/`e` open, `/` search, `g` get a page from Notion, `w` add to / remove from Working, `p` publish, `s` sync, `S` sync mode, `P` pull, `d` diff with the live Notion page
+(shown in the right panel; `Esc` returns to the preview or clears the search), `D` full-screen side-by-side diff, `n` new draft,
+`o` browser, `L` log in this folder, `r` refresh, `␣`/`za`/`h`/`l` fold, `1 2 3 4 0` / `⇥` switch panels,
 `?` help, `q` close.
 
 Choices and prompts (publish confirmation, parent page, conflicts, new page title)
@@ -125,7 +138,10 @@ folder instead, set `sync_dir = "~/notion"`.
 |---|---|
 | `:Notion` / `:Notion ui` | Toggle the dashboard |
 | `:Notion open` | Pick a synced page with `vim.ui.select` (`●` = unpublished changes) |
-| `:Notion sync` | Pull pages changed in Notion (including pages whose sub-pages were added or renamed). Pages with unpublished local edits are **skipped**, never overwritten |
+| `:Notion sync` | Pull pages changed in Notion (including pages whose sub-pages were added or renamed). Pages with unpublished local edits are **skipped**, never overwritten. Pages deleted, archived or unshared in Notion are removed locally (each one is double-checked with Notion first; files with unpublished edits are kept, and you're asked before removing most of the folder) |
+| `:Notion get[!] [url\|id\|title]` | Pull just one page: by URL/ID, or search Notion by title and pick. Asks whether to include its sub-pages (`!` includes them). Adds it to Working |
+| `:Notion search [text]` | Quickfix list of matching lines across pulled pages (every word must appear; lowercase ignores case) |
+| `:Notion work` | Add the current page to Working, or remove it |
 | `:w` | Save locally. Nothing is sent to Notion |
 | `:Notion publish` | Push the current buffer to Notion (asks for confirmation, shows blocks added / removed and title changes). If the page changed in Notion since your last sync you can overwrite, see the diff, or cancel |
 | `:Notion diff` | Side-by-side diff: Notion (left) vs your local copy (right) |
@@ -166,6 +182,7 @@ require("notion").setup({
   confirm_publish = true,
   notify_on_save = true,    -- one-time "saved locally" hint per buffer
   sync_on_startup = false,
+  sync_all = true,          -- default sync mode; false = only pages you already pulled. `S` in the dashboard overrides it per folder
   filter = nil,             -- fun(page): boolean, choose which pages to sync
 })
 ```
@@ -189,6 +206,7 @@ Statusline component: `require("notion").statusline()` returns `Notion ✓`
 | `NotionPulled` | after a page is re-downloaded | `{ id, buf }` |
 | `NotionPublished` | after a successful publish | `{ id, buf }` |
 | `NotionLogin` | after login / logout | — |
+| `NotionWorking` | after `:Notion work` | `{ doc, working }` |
 
 ## Markdown mapping
 

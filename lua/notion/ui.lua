@@ -5,15 +5,26 @@ local store = require("notion.store")
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("notion.ui")
-local PANELS = { "status", "pages", "changes", "preview", "hints" }
-local TITLES = { status = "[1] Status", pages = "[2] Pages", changes = "[3] Unpublished", preview = "[0] Preview" }
-local CYCLE = { "pages", "changes", "preview" }
+local PANELS = { "status", "working", "pages", "changes", "preview", "hints" }
+local TITLES = {
+	status = "[1] Status",
+	working = "[2] Working",
+	pages = "[3] Pages",
+	changes = "[4] Unpublished",
+	preview = "[0] Preview",
+}
+local CYCLE = { "working", "pages", "changes", "preview" }
+local LISTS = { working = true, pages = true, changes = true }
 local MARK = { modified = { "M", "NotionModified" }, new = { "A", "NotionNew" } }
 
 local HINTS = {
 	{ "Open", "⏎" },
+	{ "Search", "/" },
+	{ "Get", "g" },
+	{ "Work", "w" },
 	{ "Publish", "p" },
 	{ "Sync", "s" },
+	{ "Mode", "S" },
 	{ "Pull", "P" },
 	{ "Diff", "d" },
 	{ "New", "n" },
@@ -26,9 +37,13 @@ local HINTS = {
 local HELP = {
 	"# Keys",
 	"",
-	"- `⏎` / `e`  open the page for editing",
+	"- `⏎` / `e`  open the page for editing (at the first match when searching)",
+	"- `/`  search pages by title and content (`Esc` clears the search)",
+	"- `g`  get one page from Notion by URL, ID or title, optionally with its sub-pages",
+	"- `w`  add or remove the page from Working",
 	"- `p`  publish the page to Notion",
-	"- `s`  sync: pull everything changed in Notion",
+	"- `s`  sync: pull everything changed in Notion (or only pages you have, see `S`)",
+	"- `S`  sync mode: all pages, or only pages you already pulled and new sub-pages under them",
 	"- `P`  pull this page (discards local edits after asking)",
 	"- `d`  diff with the live Notion page, shown here (`Esc` goes back to the preview)",
 	"- `D`  full-screen side-by-side diff",
@@ -37,10 +52,10 @@ local HELP = {
 	"- `␣` / `za`  fold or unfold, `h` / `l`  collapse or expand",
 	"- `r`  refresh",
 	"- `L`  log in to Notion for this folder",
-	"- `1` `2` `3` `0`  jump to a panel, `⇥` / `⇧⇥`  cycle panels",
+	"- `1` `2` `3` `4` `0`  jump to a panel, `⇥` / `⇧⇥`  cycle panels",
 	"- `q` / `Esc`  close",
 	"",
-	"`M` = unpublished changes, `A` = new draft, never published.",
+	"`M` = unpublished changes, `A` = new draft, never published, `★` = in Working.",
 	"`:w` in a page only saves locally. Nothing reaches Notion until you publish.",
 }
 
@@ -64,8 +79,9 @@ local function layout()
 	local lw = math.max(30, math.floor(W * 0.38))
 	local s_out = 5
 	local rest = avail - s_out
-	local c_out = math.max(4, math.floor(rest * 0.3))
-	local p_out = rest - c_out
+	local w_out = math.max(4, math.floor(rest * 0.3))
+	local c_out = math.max(4, math.floor(rest * 0.2))
+	local p_out = rest - w_out - c_out
 	local function box(row, col, w, h)
 		return {
 			relative = "editor",
@@ -80,8 +96,9 @@ local function layout()
 	end
 	return {
 		status = box(0, 0, lw, s_out),
-		pages = box(s_out, 0, lw, p_out),
-		changes = box(s_out + p_out, 0, lw, c_out),
+		working = box(s_out, 0, lw, w_out),
+		pages = box(s_out + w_out, 0, lw, p_out),
+		changes = box(s_out + w_out + p_out, 0, lw, c_out),
 		preview = box(0, lw, W - lw, avail),
 		hints = {
 			relative = "editor",
@@ -151,6 +168,34 @@ local function build_tree(docs)
 	return rows
 end
 
+-- Docs in the working set plus all their sub-pages.
+local function working_docs(docs)
+	local kids = {}
+	for _, d in ipairs(docs) do
+		if d.parent_id then
+			kids[d.parent_id] = kids[d.parent_id] or {}
+			table.insert(kids[d.parent_id], d)
+		end
+	end
+	local out, seen = {}, {}
+	local function add(d)
+		if seen[d.path] then
+			return
+		end
+		seen[d.path] = true
+		out[#out + 1] = d
+		for _, c in ipairs(d.id and kids[d.id] or {}) do
+			add(c)
+		end
+	end
+	for _, d in ipairs(docs) do
+		if store.is_working(d) then
+			add(d)
+		end
+	end
+	return out
+end
+
 local function render_rows(name, rows, empty)
 	if #rows == 0 then
 		set_lines(name, { "  " .. empty })
@@ -173,6 +218,12 @@ local function render_rows(name, rows, empty)
 		end
 		if r.has_kids then
 			hl(name, i - 1, r.glyph_col, r.glyph_col + #"▾", "NotionDim")
+		end
+		if name ~= "working" and store.is_working(r.doc) then
+			vim.api.nvim_buf_set_extmark(state.bufs[name], ns, i - 1, 0, {
+				virt_text = { { " ★", "NotionKey" } },
+				virt_text_pos = "eol",
+			})
 		end
 	end
 end
@@ -212,14 +263,16 @@ local function render_status(docs)
 	else
 		l0 = " ○ Not logged in · press L"
 	end
-	local l1 = (" %d pages · %d unpublished"):format(pages, dirty)
+	local mode = store.sync_all() and "sync: all" or "sync: pulled only"
+	local l1 = (" %d pages · %d unpublished · %s"):format(pages, dirty, mode)
 	local l2 = (" %s · %s"):format(ago(store.index().last_sync), vim.fn.fnamemodify(config.sync_dir(), ":~"))
 	set_lines("status", { l0, l1, l2 })
 	hl("status", 0, 0, #l0, config.token() and "NotionNew" or "NotionModified")
 	if dirty > 0 then
-		local s = l1:find("%d+ unpublished")
-		hl("status", 1, s - 1, #l1, "NotionModified")
+		local s, e = l1:find("%d+ unpublished")
+		hl("status", 1, s - 1, e, "NotionModified")
 	end
+	hl("status", 1, #l1 - #mode, #l1, "NotionDim")
 	hl("status", 2, 0, #l2, "NotionDim")
 end
 
@@ -243,7 +296,7 @@ end
 -------------------------------------------------------------------------------
 
 local function list_panel()
-	if state.focus == "pages" or state.focus == "changes" then
+	if LISTS[state.focus] then
 		return state.focus
 	end
 	return state.last_list or "pages"
@@ -260,13 +313,27 @@ local function current_doc()
 	return r and r.doc
 end
 
-local function show_preview(lines, ft, title)
+---@param cursor? integer line to scroll to (a search match)
+local function show_preview(lines, ft, title, cursor)
 	set_lines("preview", lines)
-	local buf = state.bufs.preview
+	local buf, win = state.bufs.preview, state.wins.preview
 	if vim.bo[buf].filetype ~= ft then
 		vim.bo[buf].filetype = ft
 	end
 	set_title("preview", title)
+	if state.match then
+		pcall(vim.fn.matchdelete, state.match, win)
+		state.match = nil
+	end
+	if state.query then
+		state.match = vim.fn.matchadd("Search", store.query_pattern(state.query), 10, -1, { window = win })
+	end
+	pcall(vim.api.nvim_win_set_cursor, win, { cursor or 1, 0 })
+	if cursor then
+		vim.api.nvim_win_call(win, function()
+			vim.cmd("normal! zz")
+		end)
+	end
 end
 
 local function update_preview()
@@ -280,11 +347,21 @@ local function update_preview()
 	end
 	state.diff = nil
 	if not d then
-		show_preview(
-			{ "", "  No pages yet.", "", "  Press `s` to sync from Notion or `n` to start a draft." },
-			"markdown",
-			TITLES.preview
-		)
+		local msg = list_panel() == "working"
+				and {
+					"",
+					"  Nothing in Working yet.",
+					"",
+					"  Press `w` on a page to add it here (its sub-pages come with it),",
+					"  or `g` to get a page from Notion.",
+				}
+			or {
+				"",
+				"  No pages yet.",
+				"",
+				"  Press `s` to sync, `g` to get one page from Notion or `n` to start a draft.",
+			}
+		show_preview(msg, "markdown", TITLES.preview)
 		return
 	end
 	local base = d.status == "modified" and store.read_base(d.id)
@@ -295,22 +372,26 @@ local function update_preview()
 		show_preview(lines, "diff", "[0] Unpublished changes · " .. d.title)
 	else
 		local lines = d.body ~= "" and vim.split(d.body, "\n", { plain = true }) or { "_(empty)_" }
-		show_preview(lines, "markdown", "[0] " .. d.title .. (d.status == "new" and " · draft" or ""))
+		local r = current_row()
+		local cursor = r and r.lnum and (r.lnum - (d.body_start or 1) + 1)
+		show_preview(lines, "markdown", "[0] " .. d.title .. (d.status == "new" and " · draft" or ""), cursor)
 	end
 end
 
 ---Re-read docs and redraw every panel, keeping the selected doc selected.
-function M.refresh()
+---@param cached? boolean reuse the docs read by the last refresh (for live search)
+function M.refresh(cached)
 	if not state then
 		return
 	end
 	local keep = {}
-	for _, name in ipairs({ "pages", "changes" }) do
+	for _, name in ipairs({ "working", "pages", "changes" }) do
 		local r = current_row(name)
 		keep[name] = r and r.doc.path
 	end
 
-	local docs = store.docs()
+	local docs = (cached == true and state.docs) or store.docs()
+	state.docs = docs
 	local changes = {}
 	for _, d in ipairs(docs) do
 		if d.status then
@@ -320,16 +401,30 @@ function M.refresh()
 	table.sort(changes, function(a, b)
 		return by_title(a.doc, b.doc)
 	end)
-	state.rows.pages = build_tree(docs)
+	state.rows.working = build_tree(working_docs(docs))
 	state.rows.changes = changes
+	if state.query then
+		state.rows.pages = vim.tbl_map(function(m)
+			return { doc = m.doc, depth = 0, has_kids = false, lnum = m.lnum }
+		end, store.search(docs, state.query))
+	else
+		state.rows.pages = build_tree(docs)
+	end
 
 	render_status(docs)
-	render_rows("pages", state.rows.pages, "No pages. Press s to sync.")
+	render_rows("working", state.rows.working, "Press w on a page to add it here")
+	if state.query then
+		render_rows("pages", state.rows.pages, "No matches")
+		set_title("pages", ("%s · /%s (%d)"):format(TITLES.pages, state.query, #state.rows.pages))
+	else
+		render_rows("pages", state.rows.pages, "No pages. Press s to sync or g to get one.")
+		set_title("pages", TITLES.pages)
+	end
 	render_rows("changes", changes, "Nothing to publish ✓")
 	set_title("changes", ("%s (%d)"):format(TITLES.changes, #changes))
 	render_hints()
 
-	for _, name in ipairs({ "pages", "changes" }) do
+	for _, name in ipairs({ "working", "pages", "changes" }) do
 		local target = 1
 		for i, r in ipairs(state.rows[name]) do
 			if r.doc.path == keep[name] then
@@ -350,7 +445,7 @@ function M.focus(name)
 		return
 	end
 	state.focus = name
-	if name == "pages" or name == "changes" then
+	if LISTS[name] then
 		state.last_list = name
 	end
 	for _, n in ipairs(PANELS) do
@@ -405,13 +500,34 @@ local function with_doc(fn)
 end
 
 local function edit(d)
+	local r = current_row()
+	local lnum, query = r and r.doc == d and r.lnum, state.query
 	M.close()
 	vim.cmd.edit(vim.fn.fnameescape(d.path))
+	if lnum then
+		pcall(vim.api.nvim_win_set_cursor, 0, { lnum, 0 })
+		vim.cmd("normal! zz")
+	end
+	if query then
+		-- `n` / `N` keep jumping between matches.
+		vim.fn.setreg("/", store.query_pattern(query))
+		vim.v.hlsearch = 1
+	end
+end
+
+---@param query? string nil clears the search
+local function set_query(query)
+	query = query and vim.trim(query) or ""
+	state.query = query ~= "" and query or nil
+	M.refresh(true)
+	pcall(vim.api.nvim_win_set_cursor, state.wins.pages, { 1, 0 })
+	update_preview()
 end
 
 local function toggle_fold(want)
-	local r = current_row("pages")
-	if state.focus ~= "pages" or not r or not r.has_kids then
+	local name = list_panel()
+	local r = current_row(name)
+	if (name ~= "pages" and name ~= "working") or not r or not r.has_kids then
 		return
 	end
 	local id = r.doc.id
@@ -483,6 +599,54 @@ local actions = {
 	sync = function()
 		require("notion.sync").sync()
 	end,
+	search = function()
+		local before = state.query
+		M.focus("pages")
+		require("notion.modal").input({
+			prompt = "Search pages (title and content)",
+			default = before,
+			on_change = function(text)
+				if state then
+					set_query(text)
+				end
+			end,
+		}, function(text)
+			if state then
+				set_query(text == nil and before or text)
+			end
+		end)
+	end,
+	get = function()
+		require("notion.sync").get()
+	end,
+	sync_mode = function()
+		local all = store.sync_all()
+		local items = {
+			{ value = true, label = "All pages shared with the integration" },
+			{ value = false, label = "Only pages I already have" },
+		}
+		require("notion.modal").select(items, {
+			title = "Sync mode",
+			prompt = "What should sync (s) download for this folder?",
+			detail = "“Only pages I already have” updates pulled pages and brings in new sub-pages under them; "
+				.. "other new pages are skipped (add them with g). "
+				.. "Saved for "
+				.. vim.fn.fnamemodify(config.sync_dir(), ":~")
+				.. ".",
+			format_item = function(it)
+				return it.label .. (it.value == all and "  (current)" or "")
+			end,
+		}, function(choice)
+			if choice and state then
+				store.set_sync_all(choice.value)
+				M.refresh(true)
+			end
+		end)
+	end,
+	work = with_doc(function(d)
+		store.set_working(d, not store.is_working(d))
+		M.refresh(true)
+	end),
 	new = function()
 		M.close()
 		require("notion").new()
@@ -499,6 +663,8 @@ local function map_keys()
 			if state.diff then
 				state.diff = nil
 				update_preview()
+			elseif state.query then
+				set_query(nil)
 			else
 				M.close()
 			end
@@ -514,9 +680,12 @@ local function map_keys()
 			M.focus("status")
 		end,
 		["2"] = function()
-			M.focus("pages")
+			M.focus("working")
 		end,
 		["3"] = function()
+			M.focus("pages")
+		end,
+		["4"] = function()
 			M.focus("changes")
 		end,
 		["0"] = function()
@@ -527,9 +696,13 @@ local function map_keys()
 		p = actions.publish,
 		P = actions.pull,
 		s = actions.sync,
+		S = actions.sync_mode,
 		d = actions.diff,
 		n = actions.new,
 		o = actions.browse,
+		["/"] = actions.search,
+		g = actions.get,
+		w = actions.work,
 		L = function()
 			require("notion").login()
 		end,
@@ -550,8 +723,8 @@ local function map_keys()
 			toggle_fold(false)
 		end,
 	}
-	for _, name in ipairs({ "status", "pages", "changes", "preview" }) do
-		local keys = name == "pages" and vim.tbl_extend("force", common, fold) or common
+	for _, name in ipairs({ "status", "working", "pages", "changes", "preview" }) do
+		local keys = (name == "pages" or name == "working") and vim.tbl_extend("force", common, fold) or common
 		for lhs, fn in pairs(keys) do
 			vim.keymap.set("n", lhs, fn, { buffer = state.bufs[name], nowait = true, silent = true })
 		end
@@ -564,7 +737,7 @@ local function autocmds()
 	for name, win in pairs(state.wins) do
 		name_of[win] = name
 	end
-	for _, name in ipairs({ "pages", "changes" }) do
+	for _, name in ipairs({ "working", "pages", "changes" }) do
 		vim.api.nvim_create_autocmd("CursorMoved", {
 			group = group,
 			buffer = state.bufs[name],
@@ -603,7 +776,7 @@ local function autocmds()
 	})
 	vim.api.nvim_create_autocmd("User", {
 		group = group,
-		pattern = { "NotionSynced", "NotionPublished", "NotionPulled", "NotionLogin" },
+		pattern = { "NotionSynced", "NotionPublished", "NotionPulled", "NotionLogin", "NotionWorking" },
 		callback = function()
 			if state then
 				state.diff = nil -- the live diff is stale now
@@ -625,7 +798,7 @@ function M.open()
 		return M.focus("pages")
 	end
 	set_hl()
-	state = { wins = {}, bufs = {}, rows = { pages = {}, changes = {} }, focus = "pages" }
+	state = { wins = {}, bufs = {}, rows = { working = {}, pages = {}, changes = {} }, focus = "pages" }
 	local cfgs = layout()
 	for _, name in ipairs(PANELS) do
 		local buf = vim.api.nvim_create_buf(false, true)
@@ -638,14 +811,14 @@ function M.open()
 			cfg.title, cfg.title_pos = " " .. TITLES[name] .. " ", "left"
 		end
 		local win = vim.api.nvim_open_win(buf, false, cfg)
-		vim.wo[win].cursorline = name == "pages" or name == "changes"
+		vim.wo[win].cursorline = LISTS[name] or false
 		vim.wo[win].wrap = name == "preview"
 		state.bufs[name], state.wins[name] = buf, win
 	end
 	map_keys()
 	autocmds()
 	M.refresh()
-	M.focus("pages")
+	M.focus(#state.rows.working > 0 and "working" or "pages")
 end
 
 function M.toggle()

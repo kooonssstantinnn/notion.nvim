@@ -3,17 +3,27 @@ local config = require("notion.config")
 
 local M = {}
 
-local index, index_dir
+local index, index_dir, index_stamp
 
 local function index_path()
 	return config.sync_dir() .. "/.notion-index.json"
 end
 
+-- Identifies the index file's version on disk, so changes made by another Neovim are noticed.
+local function stamp()
+	local st = vim.uv.fs_stat(index_path())
+	return st and ("%d.%d.%d"):format(st.mtime.sec, st.mtime.nsec, st.size) or nil
+end
+
 -- Paths are stored relative to sync_dir on disk so the folder can be moved or committed.
+-- Re-read whenever the file changed on disk: every change is saved right away, so the
+-- cached copy never has unsaved edits, and a stale copy must not overwrite another
+-- Neovim's changes (e.g. the Working list).
 function M.index()
 	local dir = config.sync_dir()
-	if not index or index_dir ~= dir then
-		index, index_dir = { pages = {} }, dir
+	local current = stamp()
+	if not index or index_dir ~= dir or current ~= index_stamp then
+		index, index_dir, index_stamp = { pages = {} }, dir, current
 		local f = io.open(index_path(), "r")
 		if f then
 			local ok, data = pcall(vim.json.decode, f:read("*a"), { luanil = { object = true, array = true } })
@@ -24,6 +34,10 @@ function M.index()
 				for _, e in pairs(index.pages) do
 					if e.path and e.path:sub(1, 1) ~= "/" then
 						e.path = dir .. "/" .. e.path
+					end
+					-- Older versions stored titles with newlines.
+					if type(e.title) == "string" then
+						e.title = vim.trim((e.title:gsub("%c", " ")))
 					end
 				end
 			end
@@ -38,7 +52,7 @@ end
 
 function M.save_index()
 	local dir = config.sync_dir()
-	local data = vim.deepcopy(M.index())
+	local data = vim.deepcopy(index_dir == dir and index or M.index())
 	for _, e in pairs(data.pages) do
 		if e.path and vim.startswith(e.path, dir .. "/") then
 			e.path = e.path:sub(#dir + 2)
@@ -48,6 +62,7 @@ function M.save_index()
 	local f = assert(io.open(index_path(), "w"))
 	f:write(vim.json.encode(data))
 	f:close()
+	index_stamp = stamp()
 end
 
 function M.entry(id)
@@ -102,7 +117,7 @@ end
 local FM_ORDER = { "notion_id", "title", "url", "parent" }
 
 ---Split buffer/file lines into frontmatter table and body string.
----@return table fm, string body, integer fm_len number of frontmatter lines
+---@return table fm, string body, integer fm_len number of frontmatter lines, integer body_start line of the body's first line
 function M.split(lines)
 	local fm, start = {}, 1
 	if lines[1] == "---" then
@@ -113,9 +128,10 @@ function M.split(lines)
 					if key then
 						if val:match('^".*"$') then
 							local ok, dec = pcall(vim.json.decode, val)
-							val = ok and dec or val
+							val = ok and type(dec) == "string" and dec or val
 						end
-						fm[key] = val
+						-- Older files may hold control chars (a newline in a title is written as NUL).
+						fm[key] = vim.trim((val:gsub("%c", " ")))
 					end
 				end
 				start = i + 1
@@ -131,7 +147,7 @@ function M.split(lines)
 	while last >= first and vim.trim(lines[last]) == "" do
 		last = last - 1
 	end
-	return fm, table.concat(vim.list_slice(lines, first, last), "\n"), fm_len
+	return fm, table.concat(vim.list_slice(lines, first, last), "\n"), fm_len, first
 end
 
 function M.format_frontmatter(fm)
@@ -190,11 +206,29 @@ function M.new_path(title, id)
 		name = "Untitled" .. name
 	end
 	local dir = config.sync_dir()
+	local function taken(p)
+		return vim.uv.fs_stat(p) or M.path_owner(p)
+	end
 	local path = dir .. "/" .. name .. ".md"
-	if vim.uv.fs_stat(path) or M.path_owner(path) then
-		path = ("%s/%s (%s).md"):format(dir, name, (id or tostring(os.time())):sub(1, 8))
+	if taken(path) then
+		-- IDs in one workspace often share a prefix, so use the tail and fall back to the full ID.
+		local hex = (id or tostring(os.time())):gsub("-", "")
+		path = ("%s/%s (%s).md"):format(dir, name, hex:sub(-8))
+		if taken(path) then
+			path = ("%s/%s (%s).md"):format(dir, name, hex)
+		end
 	end
 	return path
+end
+
+---Can page `id` use the file at `path`? False when the file is linked to another page.
+function M.owns(id, path)
+	local lines = M.doc_lines(path)
+	if not lines then
+		return true
+	end
+	local fid = M.normalize_id(M.split(lines).notion_id)
+	return fid == nil or fid == id
 end
 
 ---@return string? id, table? entry
@@ -230,7 +264,7 @@ function M.doc_lines(path)
 end
 
 ---All known docs: synced pages plus local drafts in sync_dir.
----@return { id: string?, path: string, title: string, parent_id: string?, url: string?, body: string, status: "modified"|"new"|nil }[]
+---@return { id: string?, path: string, title: string, parent_id: string?, url: string?, body: string, body_start: integer, status: "modified"|"new"|nil }[]
 function M.docs()
 	local docs, seen = {}, {}
 	local function add(path, id)
@@ -243,7 +277,7 @@ function M.docs()
 			return
 		end
 		seen[path] = true
-		local fm, body = M.split(lines)
+		local fm, body, _, body_start = M.split(lines)
 		id = id or M.normalize_id(fm.notion_id)
 		local e = id and M.entry(id)
 		local status
@@ -255,10 +289,11 @@ function M.docs()
 		docs[#docs + 1] = {
 			id = id,
 			path = path,
-			title = fm.title or (e and e.title) or vim.fn.fnamemodify(path, ":t:r"),
+			title = vim.trim(((fm.title or (e and e.title) or vim.fn.fnamemodify(path, ":t:r")):gsub("%c", " "))),
 			parent_id = (e and e.parent_id) or M.normalize_id(fm.parent),
 			url = fm.url or (e and e.url),
 			body = body,
+			body_start = body_start,
 			status = status,
 		}
 	end
@@ -273,6 +308,173 @@ function M.docs()
 		end
 	end
 	return docs
+end
+
+---Does sync download every page (true) or only pages already pulled (false)?
+---Chosen per folder in the dashboard (`S`); the `sync_all` option is the default.
+function M.sync_all()
+	local v = M.index().sync_all
+	if v == nil then
+		return config.options.sync_all ~= false
+	end
+	return v
+end
+
+function M.set_sync_all(on)
+	M.index().sync_all = on
+	M.save_index()
+end
+
+---Does the local copy of page `id` have edits that weren't published (saved or not)?
+function M.has_edits(id)
+	local e = M.entry(id)
+	if not e or not e.path then
+		return false
+	end
+	local buf = M.find_buf(e.path)
+	if buf and vim.bo[buf].modified then
+		return true
+	end
+	local lines = M.doc_lines(e.path)
+	if not lines then
+		return false
+	end
+	local _, body = M.split(lines)
+	return M.hash(body) ~= e.hash
+end
+
+---Forget page `id`: delete its file (if it's really its own), base copy and index entry.
+function M.remove_page(id)
+	local e = M.entry(id)
+	if not e then
+		return
+	end
+	if e.path and M.owns(id, e.path) then
+		local buf = M.find_buf(e.path)
+		if buf then
+			pcall(vim.api.nvim_buf_delete, buf, {})
+		end
+		os.remove(e.path)
+	end
+	os.remove(base_path(id))
+	M.set_working({ id = id, path = e.path }, false)
+	M.index().pages[id] = nil
+	M.save_index()
+end
+
+-------------------------------------------------------------------------------
+-- Working set: the docs you're focused on, kept per folder in the index.
+-- Synced pages are stored by ID, drafts by path (relative to sync_dir when inside it).
+-------------------------------------------------------------------------------
+
+local function work_keys(d)
+	local keys = {}
+	if d.id then
+		keys[#keys + 1] = d.id
+	end
+	if d.path then
+		local path, dir = vim.fs.normalize(d.path), config.sync_dir()
+		keys[#keys + 1] = vim.startswith(path, dir .. "/") and path:sub(#dir + 2) or path
+	end
+	return keys
+end
+
+---@param d { id: string?, path: string? }
+function M.is_working(d)
+	local set = M.index().working or {}
+	for _, k in ipairs(work_keys(d)) do
+		if vim.tbl_contains(set, k) then
+			return true
+		end
+	end
+	return false
+end
+
+---@param d { id: string?, path: string? }
+function M.set_working(d, on)
+	local idx = M.index()
+	local keys = work_keys(d)
+	local set = vim.tbl_filter(function(k)
+		return not vim.tbl_contains(keys, k)
+	end, idx.working or {})
+	if on then
+		set[#set + 1] = keys[1]
+	end
+	idx.working = set
+	M.save_index()
+end
+
+-------------------------------------------------------------------------------
+-- Search
+-------------------------------------------------------------------------------
+
+---Search words: whitespace-separated, all must appear. Smartcase like Vim.
+---@return string[] words, boolean ignorecase
+function M.parse_query(query)
+	local words = vim.split(vim.trim(query or ""), "%s+", { trimempty = true })
+	return words, not (query or ""):find("%u")
+end
+
+---Find docs containing every word of `query` in the title or body.
+---Title hits come first; `lnum` is the file line of the first body line with a match.
+---@return { doc: table, title_hit: boolean, lnum: integer? }[]
+function M.search(docs, query)
+	local words, icase = M.parse_query(query)
+	if #words == 0 then
+		return {}
+	end
+	local function norm(s)
+		return icase and s:lower() or s
+	end
+	for i, w in ipairs(words) do
+		words[i] = norm(w)
+	end
+	local out = {}
+	for _, d in ipairs(docs) do
+		local title, body = norm(d.title), norm(d.body)
+		local all, title_hit = true, true
+		for _, w in ipairs(words) do
+			local in_title = title:find(w, 1, true) ~= nil
+			title_hit = title_hit and in_title
+			if not in_title and not body:find(w, 1, true) then
+				all = false
+				break
+			end
+		end
+		if all then
+			local lnum
+			local i = 0
+			for line in (body .. "\n"):gmatch("(.-)\n") do
+				for _, w in ipairs(words) do
+					if norm(line):find(w, 1, true) then
+						lnum = (d.body_start or 1) + i
+						break
+					end
+				end
+				if lnum then
+					break
+				end
+				i = i + 1
+			end
+			out[#out + 1] = { doc = d, title_hit = title_hit, lnum = lnum }
+		end
+	end
+	table.sort(out, function(a, b)
+		if a.title_hit ~= b.title_hit then
+			return a.title_hit
+		end
+		return a.doc.title:lower() < b.doc.title:lower()
+	end)
+	return out
+end
+
+---Vim regex matching any word of `query` (for highlighting and `n`).
+function M.query_pattern(query)
+	local words, icase = M.parse_query(query)
+	local escaped = vim.tbl_map(function(w)
+		return (w:gsub("\\", "\\\\"))
+	end, words)
+	return (icase and "\\c" or "\\C") .. "\\V\\(" .. table.concat(escaped, "\\|") .. "\\)"
 end
 
 ---Publish state of a buffer: "published" | "modified" | "new" | nil (not a Notion doc).

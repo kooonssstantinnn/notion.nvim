@@ -38,7 +38,8 @@ end
 
 ---Perform a request. Must be called inside async.run(). Retries on 429/5xx.
 ---@param token? string defaults to the current folder's login
-function M.request(method, path, body, token)
+---@param allow? table<integer, true> error statuses returned as `nil, status` instead of raised
+function M.request(method, path, body, token, allow)
 	token = token or config.token()
 	if not token then
 		error(
@@ -71,6 +72,8 @@ function M.request(method, path, body, token)
 			local status, data, raw = M._parse(obj.stdout)
 			if status >= 200 and status < 300 then
 				return data or {}
+			elseif allow and allow[status] then
+				return nil, status
 			elseif (status == 429 or status >= 500) and attempt < 6 then
 				async.sleep(math.min(1000 * 2 ^ (attempt - 1), 10000))
 			else
@@ -107,8 +110,23 @@ function M.search_pages()
 	end)
 end
 
+---Pages whose title matches `query` (first page of results, best matches first).
+function M.find_pages(query)
+	local res = M.request("POST", "/search", {
+		query = query,
+		filter = { property = "object", value = "page" },
+		page_size = 30,
+	})
+	return res.results or {}
+end
+
 function M.get_page(id)
 	return M.request("GET", "/pages/" .. id)
+end
+
+---Like get_page, but nil when the page doesn't exist or isn't shared with the integration.
+function M.find_page(id)
+	return (M.request("GET", "/pages/" .. id, nil, nil, { [404] = true }))
 end
 
 function M.list_children(id)
@@ -153,7 +171,8 @@ function M.page_title(page)
 			for _, rt in ipairs(prop.title or {}) do
 				parts[#parts + 1] = rt.plain_text or ""
 			end
-			return name, table.concat(parts)
+			-- Notion titles can carry newlines/tabs; they must stay one line in frontmatter and lists.
+			return name, vim.trim((table.concat(parts):gsub("%c", " ")))
 		end
 	end
 	return nil, ""

@@ -500,5 +500,295 @@ test("auth: old global login moves to the first folder", function()
 	vim.env.NOTION_TOKEN = env
 end)
 
+---------------------------------------------------------------------------
+-- Titles
+---------------------------------------------------------------------------
+
+test("titles: newlines from Notion become spaces", function()
+	local api = require("notion.api")
+	local page = {
+		properties = {
+			Name = { type = "title", title = { { plain_text = "Boards\nGuide" }, { plain_text = "\n" } } },
+		},
+	}
+	eq(select(2, api.page_title(page)), "Boards Guide")
+end)
+
+test("titles: NUL-mangled frontmatter from older versions reads as one line", function()
+	local store = require("notion.store")
+	local fm = store.split({ "---", "title: Boards Guide\n", "---", "", "body" })
+	eq(fm.title, "Boards Guide")
+end)
+
+test("paths: pages with the same title and ID prefix get separate files", function()
+	local store = require("notion.store")
+	config.setup({ sync_dir = vim.fn.tempname() })
+	store.reset()
+	local seen = {}
+	for _, id in ipairs({
+		"387acbe7-7225-8022-94b0-f2db97b6c911",
+		"387acbe7-7225-8022-94b0-f2db97b6c922",
+		"387acbe7-7225-8022-94b0-f2db97b6c933",
+	}) do
+		local path = store.new_path("Edit step", id)
+		assert(not seen[path], "duplicate path " .. path)
+		seen[path] = true
+		store.write(path, { notion_id = id, title = "Edit step" }, "")
+		store.set_entry(id, { path = path })
+	end
+end)
+
+test("paths: a file linked to another page is not reused", function()
+	local store = require("notion.store")
+	config.setup({ sync_dir = vim.fn.tempname() })
+	store.reset()
+	local path = config.sync_dir() .. "/Shared.md"
+	store.write(path, { notion_id = "387acbe7-7225-8022-94b0-f2db97b6c911" }, "")
+	eq(store.owns("387acbe7-7225-8022-94b0-f2db97b6c911", path), true)
+	eq(store.owns("387acbe7-7225-8022-94b0-f2db97b6c922", path), false)
+	eq(store.owns("387acbe7-7225-8022-94b0-f2db97b6c922", path .. ".missing"), true)
+end)
+
+---------------------------------------------------------------------------
+-- Search, Working, targeted pulls
+---------------------------------------------------------------------------
+
+test("search: all words must match, title hits first, smartcase", function()
+	local store = require("notion.store")
+	local docs = {
+		{ title = "Zeta notes", body = "intro\n\nthe Billing flow\nend", body_start = 6, path = "z" },
+		{ title = "Billing", body = "flow chart", body_start = 6, path = "b" },
+		{ title = "Other", body = "billing only", body_start = 6, path = "o" },
+	}
+	local res = store.search(docs, "billing flow")
+	eq(
+		vim.tbl_map(function(m)
+			return m.doc.path
+		end, res),
+		{ "b", "z" }
+	)
+	eq(res[2].lnum, 8) -- third body line
+	eq(#store.search(docs, "Billing"), 2) -- uppercase: case-sensitive
+	eq(#store.search(docs, "   "), 0)
+	eq(vim.fn.match("x Billing y", store.query_pattern("billing")), 2)
+end)
+
+test("working: drafts by path, pages by id, kept in the index", function()
+	local store = require("notion.store")
+	local dir = vim.fn.tempname()
+	config.setup({ sync_dir = dir })
+	store.reset()
+	local draft = { path = dir .. "/Draft.md" }
+	local page = { id = "11111111-2222-3333-4444-555555555555", path = dir .. "/Page.md" }
+	store.set_working(draft, true)
+	store.set_working(page, true)
+	store.reset()
+	eq(store.index().working, { "Draft.md", page.id })
+	eq(store.is_working(draft), true)
+	-- once published, the draft is still found by its path
+	eq(store.is_working({ id = "99999999-2222-3333-4444-555555555555", path = draft.path }), true)
+	store.set_working(page, false)
+	eq(store.is_working(page), false)
+end)
+
+test("get: pulls a page with nested sub-pages and adds it to Working", function()
+	local dir = vim.fn.tempname()
+	require("notion").setup({ sync_dir = dir, notify_on_save = false, token = "t", sync_all = false })
+	local api, store, sync = require("notion.api"), require("notion.store"), require("notion.sync")
+	local R, A, B, X =
+		"10000000-0000-0000-0000-000000000000",
+		"a0000000-0000-0000-0000-000000000000",
+		"b0000000-0000-0000-0000-000000000000",
+		"f0000000-0000-0000-0000-000000000000"
+	local function pg(id, title, parent)
+		return {
+			id = id,
+			url = "u",
+			last_edited_time = "2026-01-01T00:00:00.000Z",
+			parent = parent and { type = "page_id", page_id = parent } or { type = "workspace" },
+			properties = { title = { type = "title", title = { { plain_text = title } } } },
+		}
+	end
+	local C, D = "c0000000-0000-0000-0000-000000000000", "d0000000-0000-0000-0000-000000000000"
+	local pages = { [R] = pg(R, "Root"), [A] = pg(A, "A", R), [B] = pg(B, "B", A), [X] = pg(X, "Elsewhere") }
+	api.get_page = function(id)
+		return pages[id]
+	end
+	api.fetch_tree = function(id)
+		if id == R then
+			return { child_page(A, "A") }
+		elseif id == A then
+			return { child_page(B, "B") }
+		end
+		return {}
+	end
+	sync.get("https://www.notion.so/Root-" .. R:gsub("-", ""), true)
+	for _, id in ipairs({ R, A, B }) do
+		assert(store.entry(id), "not pulled: " .. id)
+	end
+	eq(store.entry(X), nil)
+	eq(store.index().working, { R })
+
+	-- sync_all = false: sync leaves pages you never pulled alone,
+	-- but new sub-pages (and their sub-pages) under pages you have come along
+	pages[C] = pg(C, "New under A", A)
+	pages[D] = pg(D, "New under C", C)
+	api.search_pages = function()
+		return vim.tbl_values(pages)
+	end
+	sync.sync()
+	eq(store.entry(X), nil)
+	assert(store.entry(C) and store.entry(D), "new sub-pages not pulled")
+	eq(store.entry(D).parent_id, C)
+end)
+
+test("ui: dashboard opens with Working, search and closes", function()
+	local dir = vim.fn.tempname()
+	require("notion").setup({ sync_dir = dir, notify_on_save = false, token = "t" })
+	local store, ui = require("notion.store"), require("notion.ui")
+	store.write(dir .. "/One.md", { title = "One\n" }, "hello world")
+	store.write(dir .. "/Two.md", { title = "Two" }, "other text")
+	store.set_working({ path = dir .. "/One.md" }, true)
+	ui.open()
+	vim.api.nvim_feedkeys("w", "x", false) -- focus starts on Working: removes One
+	eq(store.is_working({ path = dir .. "/One.md" }), false)
+	ui.refresh()
+	ui.close()
+end)
+
+test("titles: modal choices and old index titles with newlines", function()
+	local store = require("notion.store")
+	local dir = vim.fn.tempname()
+	config.setup({ sync_dir = dir })
+	vim.fn.mkdir(dir, "p")
+	vim.fn.writefile(
+		{ vim.json.encode({ pages = { x = { path = "X.md", title = "Boards Guide\n" } } }) },
+		dir .. "/.notion-index.json"
+	)
+	store.reset()
+	eq(store.entry("x").title, "Boards Guide")
+	local picked
+	require("notion.modal").select({ "a\nb", "c" }, {}, function(it)
+		picked = it
+	end)
+	eq(vim.api.nvim_get_current_line(), "    a b")
+	vim.api.nvim_feedkeys(vim.keycode("<CR>"), "x", false)
+	vim.wait(100, function()
+		return picked ~= nil
+	end)
+	eq(picked, "a\nb")
+end)
+
+test("index: changes from another Neovim are not overwritten", function()
+	local store = require("notion.store")
+	local dir = vim.fn.tempname()
+	config.setup({ sync_dir = dir })
+	store.reset()
+	store.set_entry("a", { path = dir .. "/A.md", title = "A" })
+	-- another instance adds a page to Working and saves the whole index
+	local path = dir .. "/.notion-index.json"
+	local data = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+	data.working = { "a" }
+	vim.fn.writefile({ vim.json.encode(data) }, path)
+	-- this instance saves something else afterwards
+	store.set_entry("b", { path = dir .. "/B.md", title = "B" })
+	store.reset()
+	eq(store.index().working, { "a" })
+	eq(store.entry("b").title, "B")
+end)
+
+test("sync mode: per-folder choice overrides the sync_all option", function()
+	local store = require("notion.store")
+	config.setup({ sync_dir = vim.fn.tempname(), sync_all = false })
+	store.reset()
+	eq(store.sync_all(), false)
+	store.set_sync_all(true)
+	store.reset()
+	eq(store.sync_all(), true)
+	config.setup({ sync_dir = vim.fn.tempname() })
+	store.reset()
+	eq(store.sync_all(), true)
+end)
+
+test("sync: pages deleted in Notion are removed locally, edited ones kept", function()
+	local dir = vim.fn.tempname()
+	require("notion").setup({ sync_dir = dir, notify_on_save = false, token = "t" })
+	local api, store, sync = require("notion.api"), require("notion.store"), require("notion.sync")
+	local T = "2026-01-01T00:00:00.000Z"
+	local function id(c)
+		return c .. ("0"):rep(7) .. "-0000-0000-0000-000000000000"
+	end
+	local function pg(i, extra)
+		return vim.tbl_extend("force", {
+			id = i,
+			url = "u",
+			last_edited_time = T,
+			parent = { type = "workspace" },
+			properties = { title = { type = "title", title = { { plain_text = i:sub(1, 1) } } } },
+		}, extra or {})
+	end
+	local live, deleted, trashed, edited, lagging = id("1"), id("2"), id("3"), id("4"), id("5")
+	for _, i in ipairs({ live, deleted, trashed, edited, lagging }) do
+		local path = dir .. "/" .. i:sub(1, 1) .. ".md"
+		store.write(path, { notion_id = i }, "body")
+		store.save_base(i, "body")
+		store.set_entry(i, { path = path, title = i:sub(1, 1), last_edited = T, hash = store.hash("body") })
+	end
+	store.set_working({ id = deleted }, true)
+	store.write(dir .. "/4.md", { notion_id = edited }, "my local edit")
+
+	api.search_pages = function()
+		return { pg(live), pg(trashed, { in_trash = true }) }
+	end
+	api.find_page = function(i)
+		if i == trashed then
+			return pg(trashed, { in_trash = true })
+		elseif i == lagging then
+			return pg(lagging) -- missing from search, but still exists
+		end
+		return nil -- 404
+	end
+	api.fetch_tree = function()
+		return {}
+	end
+	sync.sync()
+
+	eq(store.entry(deleted), nil)
+	eq(store.entry(trashed), nil)
+	eq(vim.fn.filereadable(dir .. "/2.md"), 0)
+	eq(vim.fn.filereadable(dir .. "/3.md"), 0)
+	eq(store.read_base(deleted), nil)
+	eq(store.is_working({ id = deleted }), false)
+	assert(store.entry(edited) and vim.fn.filereadable(dir .. "/4.md") == 1, "edited page removed")
+	assert(store.entry(lagging) and store.entry(live), "live page removed")
+end)
+
+test("sync: removing most pages asks first", function()
+	local dir = vim.fn.tempname()
+	require("notion").setup({ sync_dir = dir, notify_on_save = false, token = "t" })
+	local api, store, sync, async =
+		require("notion.api"), require("notion.store"), require("notion.sync"), require("notion.async")
+	for n = 10, 21 do
+		local i = ("%08d-0000-0000-0000-000000000000"):format(n)
+		store.write(dir .. "/" .. n .. ".md", { notion_id = i }, "")
+		store.set_entry(i, { path = dir .. "/" .. n .. ".md", title = tostring(n), hash = store.hash("") })
+	end
+	api.search_pages = function()
+		return {}
+	end
+	api.find_page = function()
+		return nil
+	end
+	local asked, confirm = false, async.confirm
+	async.confirm = function()
+		asked = true
+		return false
+	end
+	sync.sync()
+	async.confirm = confirm
+	eq(asked, true)
+	eq(vim.tbl_count(store.index().pages), 12)
+end)
+
 io.stdout:write(("%d passed, %d failed\n"):format(passed, failures))
 os.exit(failures == 0 and 0 or 1)

@@ -86,7 +86,10 @@ function M.select(items, opts, cb)
 	opts = opts or {}
 	set_hl()
 	local fmt = opts.format_item or tostring
-	local labels = vim.tbl_map(fmt, items)
+	-- Labels must be single lines (titles from Notion can contain newlines).
+	local labels = vim.tbl_map(function(it)
+		return vim.trim((tostring(fmt(it)):gsub("%c", " ")))
+	end, items)
 
 	-- First free letter of each label becomes its hotkey.
 	local hotkeys, used = {}, { j = true, k = true, q = true }
@@ -213,7 +216,7 @@ function M.select(items, opts, cb)
 	render()
 end
 
----Same contract as vim.ui.input.
+---Same contract as vim.ui.input. Extra opts: `on_change(text)` called as you type.
 function M.input(opts, cb)
 	opts = opts or {}
 	set_hl()
@@ -241,6 +244,14 @@ function M.input(opts, cb)
 		vim.keymap.set(mode, "<C-c>", cancel, { buffer = buf, nowait = true })
 	end
 	vim.keymap.set("n", "q", cancel, { buffer = buf, nowait = true })
+	if opts.on_change then
+		vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+			buffer = buf,
+			callback = function()
+				opts.on_change(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "")
+			end,
+		})
+	end
 	close_on_leave(buf, cancel)
 	vim.cmd("startinsert!")
 end

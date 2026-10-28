@@ -116,6 +116,7 @@ function M.new(title)
 		end
 		local path = store().new_path(t)
 		store().write(path, { title = t, parent = config.options.default_parent }, "")
+		store().set_working({ path = path }, true)
 		vim.cmd.edit(vim.fn.fnameescape(path))
 		vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(0), 0 })
 		notify("New draft. It stays local until you run :Notion publish.")
@@ -137,6 +138,66 @@ end
 
 function M.sync()
 	sync().sync()
+end
+
+---Pull one page by URL, ID or title. `with_children`: true/false, nil = ask.
+function M.get(input, with_children)
+	sync().get(input, with_children)
+end
+
+---Quickfix list of lines matching `query` in pulled docs (all words must be in the doc).
+function M.search(query)
+	if not query or vim.trim(query) == "" then
+		require("notion.modal").input({ prompt = "Search pulled pages" }, function(q)
+			if q and q ~= "" then
+				M.search(q)
+			end
+		end)
+		return
+	end
+	local words, icase = store().parse_query(query)
+	local items = {}
+	for _, m in ipairs(store().search(store().docs(), query)) do
+		local lines = store().doc_lines(m.doc.path) or {}
+		local found = false
+		for lnum = m.doc.body_start or 1, #lines do
+			local line = icase and lines[lnum]:lower() or lines[lnum]
+			for _, w in ipairs(words) do
+				if line:find(icase and w:lower() or w, 1, true) then
+					items[#items + 1] =
+						{ filename = m.doc.path, lnum = lnum, text = m.doc.title .. ": " .. vim.trim(lines[lnum]) }
+					found = true
+					break
+				end
+			end
+		end
+		if not found then
+			items[#items + 1] = { filename = m.doc.path, lnum = 1, text = m.doc.title .. " (title)" }
+		end
+	end
+	if #items == 0 then
+		notify(("No pulled page matches “%s”"):format(query), vim.log.levels.WARN)
+		return
+	end
+	vim.fn.setqflist({}, " ", { title = "Notion: " .. query, items = items })
+	vim.fn.setreg("/", store().query_pattern(query))
+	vim.cmd("copen")
+end
+
+---Add the current buffer's doc to Working, or remove it.
+function M.work(buf)
+	buf = buf or vim.api.nvim_get_current_buf()
+	local path = vim.api.nvim_buf_get_name(buf)
+	local fm = store().split(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+	local doc = { id = store().normalize_id(fm.notion_id), path = path ~= "" and path or nil }
+	if not doc.id and not doc.path then
+		notify("Save this buffer to a file first", vim.log.levels.WARN)
+		return
+	end
+	local on = not store().is_working(doc)
+	store().set_working(doc, on)
+	vim.api.nvim_exec_autocmds("User", { pattern = "NotionWorking", data = { doc = doc, working = on } })
+	notify(on and "Added to Working" or "Removed from Working")
 end
 
 function M.diff(buf)
@@ -189,6 +250,15 @@ M.commands = {
 	end,
 	sync = function()
 		M.sync()
+	end,
+	get = function(args, bang)
+		M.get(args, bang or nil)
+	end,
+	search = function(args)
+		M.search(args)
+	end,
+	work = function()
+		M.work()
 	end,
 	open = function()
 		M.open()

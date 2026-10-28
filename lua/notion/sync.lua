@@ -36,7 +36,12 @@ function M.pull_page(page, force)
 	local id = page.id
 	local title_prop, title = api.page_title(page)
 	local entry = store.entry(id)
-	local path = entry and entry.path or store.new_path(title, id)
+	local path = entry and entry.path
+	if path and not store.owns(id, path) then
+		-- Older versions could give two pages the same file; move this one to its own.
+		path, entry = nil, nil
+	end
+	path = path or store.new_path(title, id)
 	local fm = {}
 
 	if vim.uv.fs_stat(path) then
@@ -107,26 +112,120 @@ function M.legacy_format(id)
 	return base ~= nil and ("\n" .. base .. "\n"):find("\n%s*<br>\n") ~= nil
 end
 
+---Remove local copies of pages that were deleted/archived in Notion or are no longer shared.
+---Absence from search isn't enough (search can lag), so each one is checked directly.
+---Files with unpublished edits are kept.
+---@param alive table<string, true> pages search returned as live
+---@return string[] removed, string[] kept titles
+function M.prune(alive)
+	local candidates = {}
+	for id in pairs(store.index().pages) do
+		if not alive[id] then
+			candidates[#candidates + 1] = id
+		end
+	end
+	local gone = {}
+	for _, id in ipairs(candidates) do
+		local ok, page = pcall(api.find_page, id)
+		if ok and (page == nil or page.archived or page.in_trash) then
+			gone[#gone + 1] = id
+		end
+	end
+	if #gone == 0 then
+		return {}, {}
+	end
+
+	local total = vim.tbl_count(store.index().pages)
+	if
+		#gone >= 10
+		and #gone * 2 >= total
+		and not async.confirm(
+			("%d of your %d pages are no longer in Notion. Remove their local copies?"):format(#gone, total),
+			"Remove",
+			{
+				title = "Sync",
+				detail = "They were deleted, archived or unshared from the integration. "
+					.. "If this is unexpected, check you're logged in to the right workspace. "
+					.. "Pages with unpublished edits are kept either way.",
+			}
+		)
+	then
+		return {}, {}
+	end
+
+	local removed, kept = {}, {}
+	for _, id in ipairs(gone) do
+		local e = store.entry(id)
+		if e then
+			local title = e.title or "Untitled"
+			if store.has_edits(id) then
+				kept[#kept + 1] = title
+			else
+				store.remove_page(id)
+				removed[#removed + 1] = title
+			end
+		end
+	end
+	table.sort(removed)
+	table.sort(kept)
+	return removed, kept
+end
+
+---"Only pages I already have": pages you pulled, plus new sub-pages under them
+---(and their sub-pages), so the sections you have stay complete.
+function M.owned_pages(pages)
+	local keep = {}
+	for _, page in ipairs(pages) do
+		keep[page.id] = store.entry(page.id) ~= nil or nil
+	end
+	local grew = true
+	while grew do
+		grew = false
+		for _, page in ipairs(pages) do
+			local parent = parent_of(page)
+			if not keep[page.id] and parent and keep[parent] then
+				keep[page.id], grew = true, true
+			end
+		end
+	end
+	return vim.tbl_filter(function(page)
+		return keep[page.id]
+	end, pages)
+end
+
 function M.sync()
 	async.run(function()
 		notify("Syncing…")
-		local pages = api.search_pages()
+		local alive = {}
+		local pages = vim.tbl_filter(function(page)
+			if page.archived or page.in_trash then
+				return false
+			end
+			alive[page.id] = true
+			return not config.options.filter or config.options.filter(page)
+		end, api.search_pages())
+		if not store.sync_all() then
+			pages = M.owned_pages(pages)
+		end
 		local results, by_id = {}, {}
 		for _, page in ipairs(pages) do
-			if not (page.archived or page.in_trash) and (not config.options.filter or config.options.filter(page)) then
-				by_id[page.id] = page
-				local e = store.entry(page.id)
-				local status = "current"
-				if not e or not vim.uv.fs_stat(e.path) or page.last_edited_time > (e.last_edited or "") then
-					status = M.pull_page(page, false)
-				else
-					local _, title = api.page_title(page)
-					if e.parent_id ~= parent_of(page) or e.title ~= title then
-						store.set_entry(page.id, { parent_id = parent_of(page), title = title })
-					end
+			by_id[page.id] = page
+			local e = store.entry(page.id)
+			local status = "current"
+			if
+				not e
+				or not vim.uv.fs_stat(e.path)
+				or page.last_edited_time > (e.last_edited or "")
+				or not store.owns(page.id, e.path)
+			then
+				status = M.pull_page(page, false)
+			else
+				local _, title = api.page_title(page)
+				if e.parent_id ~= parent_of(page) or e.title ~= title then
+					store.set_entry(page.id, { parent_id = parent_of(page), title = title })
 				end
-				results[page.id] = status
 			end
+			results[page.id] = status
 		end
 		-- Adding, renaming or moving a sub-page doesn't bump the parent's last_edited_time,
 		-- so also re-pull parents whose sub-page placeholders no longer match.
@@ -144,10 +243,27 @@ function M.sync()
 				conflicts[#conflicts + 1] = "  " .. select(2, api.page_title(by_id[id]))
 			end
 		end
+		local removed, kept = M.prune(alive)
+
 		store.index().last_sync = os.time()
 		store.save_index()
 		emit("NotionSynced")
 		local msg = ("Synced %d pages: %d updated, %d up to date"):format(#pages, counts.pulled, counts.current)
+		if #removed > 0 then
+			msg = msg
+				.. ("\nRemoved %d page%s deleted in Notion:\n  "):format(#removed, #removed == 1 and "" or "s")
+				.. table.concat(removed, "\n  ")
+		end
+		if #kept > 0 then
+			notify(
+				("%d page%s deleted in Notion still %s unpublished local edits, so the local file was kept:\n  "):format(
+					#kept,
+					#kept == 1 and " was" or "s were",
+					#kept == 1 and "has" or "have"
+				) .. table.concat(kept, "\n  "),
+				vim.log.levels.WARN
+			)
+		end
 		if counts.conflict > 0 then
 			msg = msg
 				.. ("\n%d changed in Notion but have unpublished local edits (use :Notion pull! to overwrite, or :Notion diff):\n"):format(
@@ -155,6 +271,132 @@ function M.sync()
 				)
 				.. table.concat(conflicts, "\n")
 			notify(msg, vim.log.levels.WARN)
+		else
+			notify(msg)
+		end
+	end)
+end
+
+-- Sub-pages listed in the last-synced copy (nested ones included).
+local function child_pages(id)
+	local ids = {}
+	for cid in (store.read_base(id) or ""):gmatch("<!%-%- notion:keep (%S+) child_page") do
+		ids[#ids + 1] = cid
+	end
+	return ids
+end
+
+local function up_to_date(page)
+	local e = store.entry(page.id)
+	return e ~= nil
+		and vim.uv.fs_stat(e.path) ~= nil
+		and page.last_edited_time <= (e.last_edited or "")
+		and store.owns(page.id, e.path)
+		and not M.children_stale(page.id)
+		and not M.legacy_format(page.id)
+end
+
+local function page_label(page)
+	local _, title = api.page_title(page)
+	return title ~= "" and title or "Untitled"
+end
+
+---Ask for a page: an ID/URL is used as is, anything else searches Notion by title.
+local function pick_page(input)
+	input = vim.trim(input or "")
+	if input == "" then
+		input = async.input({ prompt = "Notion page URL, ID or title" })
+		if not input or input == "" then
+			return nil
+		end
+	end
+	local id = store.normalize_id(input)
+	if id then
+		return api.get_page(id)
+	end
+	local found = vim.tbl_filter(function(p)
+		return not (p.archived or p.in_trash)
+	end, api.find_pages(input))
+	if #found == 0 then
+		error(
+			("No Notion page matches “%s” (only pages shared with the integration are searchable)"):format(input),
+			0
+		)
+	end
+	return async.select(found, {
+		title = "Get from Notion",
+		prompt = ("Pages matching “%s”"):format(input),
+		format_item = function(p)
+			local e = store.entry(p.id)
+			return page_label(p) .. (e and "  (pulled)" or "")
+		end,
+	})
+end
+
+---Pull one page (by ID, URL or title search), optionally with all its sub-pages,
+---and add it to the working set. `with_children`: true/false, nil = ask when it has any.
+function M.get(input, with_children)
+	async.run(function()
+		local root = pick_page(input)
+		if not root then
+			return
+		end
+		local counts = { pulled = 0, current = 0, conflict = 0 }
+		local conflicts = {}
+		local function pull(page)
+			local status = up_to_date(page) and "current" or M.pull_page(page, false)
+			counts[status] = counts[status] + 1
+			if status == "conflict" then
+				conflicts[#conflicts + 1] = "  " .. page_label(page)
+			end
+		end
+
+		notify("Pulling “" .. page_label(root) .. "”…")
+		pull(root)
+		local kids = child_pages(root.id)
+		if #kids > 0 and with_children == nil then
+			local all = ("Pull %d sub-page%s too"):format(#kids, #kids == 1 and "" or "s")
+			with_children = async.select({ all, "Just this page" }, {
+				title = "Get from Notion",
+				prompt = ("“%s” has sub-pages."):format(page_label(root)),
+				detail = "Sub-pages of sub-pages are included.",
+			}) == all
+		end
+		if with_children then
+			local queue, seen = vim.list_extend({}, kids), { [root.id] = true }
+			while #queue > 0 do
+				local id = table.remove(queue, 1)
+				if not seen[id] then
+					seen[id] = true
+					local ok, page = pcall(api.get_page, id)
+					if ok and not (page.archived or page.in_trash) then
+						pull(page)
+						vim.list_extend(queue, child_pages(id))
+					end
+				end
+			end
+		end
+
+		local e = store.entry(root.id)
+		store.set_working({ id = root.id, path = e and e.path }, true)
+		emit("NotionPulled", { id = root.id })
+		local total = counts.pulled + counts.current + counts.conflict
+		local msg = total == 1 and ("Pulled “%s” and added it to Working"):format(page_label(root))
+			or ("Pulled “%s” with %d sub-pages (%d updated, %d up to date) and added it to Working"):format(
+				page_label(root),
+				total - 1,
+				counts.pulled,
+				counts.current
+			)
+		if counts.conflict > 0 then
+			notify(
+				msg
+					.. ("\n%d have unpublished local edits and were skipped (:Notion pull! overwrites):\n"):format(
+						counts.conflict
+					)
+					.. table.concat(conflicts, "\n"),
+				vim.log.levels.WARN
+			)
 		else
 			notify(msg)
 		end
@@ -369,17 +611,21 @@ local function choose_parent(fm, title)
 	end
 	local items = {}
 	for id, e in pairs(store.index().pages) do
-		items[#items + 1] = { id = id, title = e.title or "Untitled" }
+		items[#items + 1] = { id = id, title = e.title or "Untitled", working = store.is_working({ id = id }) }
 	end
+	-- Working pages first: with hundreds of pages they're the likely parents.
 	table.sort(items, function(a, b)
+		if a.working ~= b.working then
+			return a.working
+		end
 		return a.title:lower() < b.title:lower()
 	end)
-	items[#items + 1] = { title = "Enter a page URL or ID…" }
+	table.insert(items, 1, { title = "Enter a page URL or ID…" })
 	local choice = async.select(items, {
 		title = "New Notion page",
 		prompt = ("Where should “%s” be created?"):format(title),
 		format_item = function(it)
-			return it.title
+			return (it.working and "★ " or "") .. it.title
 		end,
 	})
 	if not choice then

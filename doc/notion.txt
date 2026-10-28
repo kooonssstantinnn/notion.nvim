@@ -76,7 +76,31 @@ OAuth is not supported.
                         Download pages changed in Notion, including pages
                         whose sub-pages were added or renamed. Pages with
                         unpublished local edits are skipped, never
-                        overwritten.
+                        overwritten. In "only pages I already have" mode
+                        (`S` in the dashboard, or `sync_all = false`) only
+                        pages you already pulled are updated, plus new
+                        sub-pages created under them in Notion.
+                        Pages deleted, archived or no longer shared in
+                        Notion are removed locally after checking each one
+                        with Notion. Files with unpublished edits are kept.
+                        Removing 10+ pages and half the folder asks first.
+
+:Notion get[!] [url|id|title]                                    *:Notion-get*
+                        Pull one page instead of everything. A URL or ID is
+                        used directly; any other text searches Notion by
+                        title and lets you pick. If the page has sub-pages
+                        you're asked whether to pull them too (nested ones
+                        included); [!] pulls them without asking. The page
+                        is added to Working.
+
+:Notion search [text]                                         *:Notion-search*
+                        Quickfix list of lines in pulled pages matching
+                        `text`. Every word must appear in the page (title
+                        or content); lowercase ignores case. `n` jumps
+                        between matches afterwards.
+
+:Notion work                                                    *:Notion-work*
+                        Add the current page to Working, or remove it.
 
 :Notion publish                                              *:Notion-publish*
                         Push the current buffer to Notion. Shows how many
@@ -112,25 +136,34 @@ OAuth is not supported.
 
   [1] Status       login (`● workspace · integration` or `○ Not logged in`),
                    page counts, last sync time and folder
-  [2] Pages        the page tree; `M` = unpublished changes, `A` = new draft
-  [3] Unpublished  everything waiting to be published
+  [2] Working      the pages you're working on, with their sub-pages.
+                   Saved per folder. The dashboard opens here when it
+                   has pages.
+  [3] Pages        the page tree; `M` = unpublished changes, `A` = new draft,
+                   `★` = in Working. While searching it lists the matches.
+  [4] Unpublished  everything waiting to be published
   [0] Preview      the page, or a diff against the last sync when it has
                    local edits (computed locally, no API call)
 
 Keys ~
-  <CR> / e      open the page
+  <CR> / e      open the page (at the first match while searching)
+  /             search pages by title and content as you type
+  g             get one page from Notion (see |:Notion-get|)
+  w             add the page to Working, or remove it
   p             publish
   s             sync
+  S             sync mode: all pages, or only pages you already have.
+                Saved per folder; shown in the Status panel
   P             pull this page
   d             diff with the live Notion page in the preview panel
-  <Esc>         leave the diff, or close the dashboard
+  <Esc>         leave the diff, clear the search, or close the dashboard
   D             full-screen side-by-side diff
   n             new draft
   o             open in browser
   L             log in for this folder
   r             refresh
   <Space> / za  toggle fold; h / l collapse / expand
-  1 2 3 0       focus a panel; <Tab> / <S-Tab> cycle panels
+  1 2 3 4 0     focus a panel; <Tab> / <S-Tab> cycle panels
   ?             help
   q             close
 
@@ -173,6 +206,7 @@ Defaults: >lua
     confirm_publish = true,
     notify_on_save = true,      -- one-time "saved locally" hint per buffer
     sync_on_startup = false,
+    sync_all = true,            -- default sync mode (`S` overrides per folder)
     filter = nil,               -- fun(page): boolean
   })
 <
@@ -224,6 +258,7 @@ them; blocks you edit are recreated without them.
   NotionPulled      after a page is re-downloaded; data = { id, buf }
   NotionPublished   after a successful publish; data = { id, buf }
   NotionLogin       after login or logout
+  NotionWorking     after `:Notion work`; data = { doc, working }
 
 Example: >lua
   vim.api.nvim_create_autocmd("User", {
