@@ -3,7 +3,7 @@
 [![CI](https://github.com/kooonssstantinnn/notion.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/kooonssstantinnn/notion.nvim/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-<!-- TODO: add a screenshot / GIF of the dashboard: ![dashboard](https://…) -->
+![notion.nvim demo](assets/demo.gif)
 
 Edit your Notion pages as markdown in Neovim. Sync pages down, write freely
 (`:w` saves **locally only**), and push to Notion only when you run `:Notion publish`.
